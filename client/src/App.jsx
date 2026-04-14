@@ -170,8 +170,14 @@ export default function App() {
             if (!cancelled) setItems([]);
             return;
           }
-          const lists = await Promise.all(ids.map((id) => api.liveStreams(id)));
-          if (!cancelled) setItems(mergeStreamsById(lists));
+          const settled = await Promise.allSettled(ids.map((id) => api.liveStreams(id)));
+          const ok = settled.filter((r) => r.status === "fulfilled").map((r) => r.value);
+          const ko = settled.filter((r) => r.status === "rejected");
+          if (!cancelled) setItems(mergeStreamsById(ok));
+          if (!cancelled && ko.length > 0 && ok.length === 0) {
+            const sample = ko[0].reason?.message || "error al cargar canales";
+            setError(`No se pudieron cargar canales en vivo: ${sample}`);
+          }
         } else if (tab === "vod") {
           const data = await api.vodStreams(catId || undefined);
           if (!cancelled) setItems(data);

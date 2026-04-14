@@ -25,6 +25,7 @@ function stripQuotes(s) {
 const IPTV_BASE_URL = stripQuotes(process.env.IPTV_BASE_URL);
 const IPTV_USERNAME = stripQuotes(process.env.IPTV_USERNAME);
 const IPTV_PASSWORD = stripQuotes(process.env.IPTV_PASSWORD);
+const IPTV_API_PATH = stripQuotes(process.env.IPTV_API_PATH || "/player_api.php");
 
 const debugAuth = process.env.IPTV_DEBUG_AUTH === "1";
 const logSecrets = process.env.IPTV_LOG_SECRETS === "1";
@@ -91,8 +92,14 @@ function baseUrl() {
   return raw.replace(/\/$/, "");
 }
 
+function apiPath() {
+  const p = IPTV_API_PATH.trim();
+  if (!p) return "/player_api.php";
+  return p.startsWith("/") ? p : `/${p}`;
+}
+
 function buildXtreamUrl(params) {
-  const u = new URL(`${baseUrl()}/player_api.php`);
+  const u = new URL(`${baseUrl()}${apiPath()}`);
   u.searchParams.set("username", IPTV_USERNAME);
   u.searchParams.set("password", IPTV_PASSWORD);
   for (const [k, v] of Object.entries(params)) {
@@ -132,7 +139,7 @@ async function xtream(params) {
       const code = e.cause?.code ? ` [${e.cause.code}]` : "";
       console.error("[iptv] fetch error:", e.message, e.cause || "");
       throw new Error(
-        `No se pudo conectar al panel IPTV: ${e.message}${code}. Comprueba IPTV_BASE_URL (http vs https). En Railway muchos proveedores bloquean IPs de hosting: prueba IPTV_TLS_INSECURE=1 o despliega en un VPS con IP distinta.`
+        `No se pudo conectar al panel IPTV: ${e.message}${code}. Comprueba IPTV_BASE_URL (http vs https) y IPTV_API_PATH (${apiPath()}). En Railway muchos proveedores bloquean IPs de hosting: prueba IPTV_TLS_INSECURE=1 o despliega en un VPS con IP distinta.`
       );
     }
   }
@@ -150,7 +157,7 @@ async function xtream(params) {
 
   if (!text || !String(text).trim()) {
     throw new Error(
-      `Respuesta vacía (${r.status}) desde el panel. Revisa IPTV_BASE_URL y que el servidor exponga player_api.php.`
+      `Respuesta vacía (${r.status}) desde el panel. Revisa IPTV_BASE_URL y que el servidor exponga ${apiPath()}.`
     );
   }
 
@@ -165,7 +172,7 @@ async function xtream(params) {
     const looksHtml = /<\s*!?\s*html/i.test(body);
     throw new Error(
       looksHtml
-        ? `El panel devolvió una página HTML en lugar del API JSON. Revisa IPTV_BASE_URL (sin ruta extra; suele ser http://host:puerto) y que player_api.php exista. Vista previa: ${preview}`
+        ? `El panel devolvió una página HTML en lugar del API JSON. Revisa IPTV_BASE_URL (sin ruta extra; suele ser http://host:puerto) y que exista ${apiPath()}. Vista previa: ${preview}`
         : `Respuesta no JSON (${r.status}): ${preview}`
     );
   }
@@ -184,8 +191,8 @@ function interpretPanelNonJsonBody(s) {
   }
   if (/\b404\b/.test(t) && (t.includes("error") || t.includes("url"))) {
     return (
-      "URL del panel incorrecta (404). IPTV_BASE_URL debe ser solo host:puerto, sin rutas tipo /c/…; " +
-      "el API es /player_api.php en la raíz de ese host."
+      "URL del panel/API incorrecta (404). IPTV_BASE_URL debe ser solo host:puerto (sin rutas), " +
+      `y la ruta API correcta en IPTV_API_PATH (actual: ${apiPath()}).`
     );
   }
   if (t.includes("server under maintenance") || t.includes("maintenance")) {
@@ -197,7 +204,7 @@ function interpretPanelNonJsonBody(s) {
 app.get("/api/health", (_req, res) => {
   const configured = Boolean(IPTV_BASE_URL && IPTV_USERNAME && IPTV_PASSWORD);
   const mediaBase = configured && IPTV_BASE_URL ? baseUrl() : null;
-  res.json({ ok: true, configured, mediaBase });
+  res.json({ ok: true, configured, mediaBase, apiPath: apiPath() });
 });
 
 app.get("/api/user", async (req, res) => {
