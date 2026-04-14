@@ -55,6 +55,13 @@ function seriesHeroUrl(s, mediaBase) {
   return posterForItem(s, "series", mediaBase || "");
 }
 
+function pickDefaultVodCategoryId(vodCats) {
+  const wanted = vodCats.find((c) =>
+    /estrenos\s*2026/i.test(String(c?.category_name || "").replace(/[^\w\s]/g, " "))
+  );
+  return String((wanted || vodCats[0])?.category_id || "");
+}
+
 function toPlayableUrl(url) {
   if (!url) return url;
   if (typeof window === "undefined") return url;
@@ -126,17 +133,32 @@ export default function App() {
     if (!configured) return;
     loadUser();
     (async () => {
-      try {
-        const [lc, vc, sc] = await Promise.all([
-          api.liveCategories(),
-          api.vodCategories(),
-          api.seriesCategories(),
-        ]);
-        setLiveCats(lc);
-        setVodCats(vc);
-        setSerCats(sc);
-      } catch (e) {
-        setError(e.message);
+      const results = await Promise.allSettled([
+        api.liveCategories(),
+        api.vodCategories(),
+        api.seriesCategories(),
+      ]);
+
+      const [liveR, vodR, seriesR] = results;
+      setLiveCats(liveR.status === "fulfilled" ? liveR.value : []);
+      setVodCats(vodR.status === "fulfilled" ? vodR.value : []);
+      setSerCats(seriesR.status === "fulfilled" ? seriesR.value : []);
+
+      const failed = [];
+      if (liveR.status === "rejected") failed.push("TV en vivo");
+      if (vodR.status === "rejected") failed.push("Películas");
+      if (seriesR.status === "rejected") failed.push("Series");
+
+      if (failed.length === 0) {
+        setError("");
+      } else {
+        const firstErr =
+          liveR.status === "rejected"
+            ? liveR.reason?.message
+            : vodR.status === "rejected"
+              ? vodR.reason?.message
+              : seriesR.reason?.message;
+        setError(firstErr || "No se pudo cargar el catálogo.");
       }
     })();
   }, [configured, loadUser]);
@@ -165,8 +187,25 @@ export default function App() {
   }, [tab]);
 
   useEffect(() => {
+    // Peliculas y Series: seleccionar categoria por defecto automaticamente.
+    if (tab === "vod" && !catId && vodCats.length > 0) {
+      setCatId(pickDefaultVodCategoryId(vodCats));
+      return;
+    }
+    if (tab === "series" && !catId && serCats.length > 0) {
+      setCatId(String(serCats[0].category_id));
+    }
+  }, [tab, catId, vodCats, serCats]);
+
+  useEffect(() => {
     if (!configured) return;
     if (tab === "live" && !liveBucket) {
+      setItems([]);
+      setLoadingList(false);
+      return;
+    }
+    // Algunos paneles devuelven error en get_vod_streams/get_series sin category_id.
+    if ((tab === "vod" || tab === "series") && !catId) {
       setItems([]);
       setLoadingList(false);
       return;
@@ -337,6 +376,9 @@ export default function App() {
                   Elige <strong>Deportes</strong>, <strong>Películas</strong> o <strong>General</strong>. Los
                   canales se agrupan automáticamente según las categorías del servidor.
                 </p>
+              ) : null}
+              {(tab === "vod" || tab === "series") && !catId ? (
+                <p className="nf-live-hint">Selecciona una categoría para ver el contenido.</p>
               ) : null}
               {tab === "live" && !liveBucket ? (
                 <ul className="nf-cat-grid nf-cat-grid--three">
