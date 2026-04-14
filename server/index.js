@@ -1,3 +1,4 @@
+import dns from "node:dns";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -25,10 +26,24 @@ const IPTV_BASE_URL = stripQuotes(process.env.IPTV_BASE_URL);
 const IPTV_USERNAME = stripQuotes(process.env.IPTV_USERNAME);
 const IPTV_PASSWORD = stripQuotes(process.env.IPTV_PASSWORD);
 
-const xtreamDispatcher =
-  process.env.IPTV_TLS_INSECURE === "1"
-    ? new Agent({ connect: { rejectUnauthorized: false } })
-    : undefined;
+const tlsInsecure = process.env.IPTV_TLS_INSECURE === "1";
+const preferIpv4 = process.env.IPTV_IPV4 !== "0";
+
+const connectOpts = {
+  rejectUnauthorized: !tlsInsecure,
+};
+if (preferIpv4) {
+  connectOpts.lookup = (hostname, _opts, cb) => {
+    dns.lookup(hostname, { family: 4, all: false }, cb);
+  };
+}
+
+/** Agente HTTP(S) para el panel: timeouts, IPv4 (útil en Railway) y TLS opcional. */
+const xtreamAgent = new Agent({
+  connect: connectOpts,
+  connectTimeout: Number(process.env.IPTV_CONNECT_TIMEOUT_MS || 60000),
+  bodyTimeout: Number(process.env.IPTV_BODY_TIMEOUT_MS || 120000),
+});
 
 /** Si HTTPS falla y responde por HTTP, reutilizamos http para streams. */
 let resolvedBaseUrlOverride = null;
@@ -72,7 +87,7 @@ async function xtream(params) {
   let url = buildXtreamUrl(params);
   const fetchOpts = {
     headers: { Accept: "application/json" },
-    ...(xtreamDispatcher ? { dispatcher: xtreamDispatcher } : {}),
+    dispatcher: xtreamAgent,
   };
 
   let r;
@@ -92,10 +107,22 @@ async function xtream(params) {
       resolvedBaseUrlOverride = IPTV_BASE_URL.replace(/^https:/i, "http:");
     } else {
       const code = e.cause?.code ? ` [${e.cause.code}]` : "";
+      console.error("[iptv] fetch error:", e.message, e.cause || "");
       throw new Error(
-        `No se pudo conectar al panel IPTV: ${e.message}${code}. Comprueba IPTV_BASE_URL (muchas veces es http://…:8080, no https). Opcional: IPTV_TLS_INSECURE=1 si el certificado es problemático.`
+        `No se pudo conectar al panel IPTV: ${e.message}${code}. Comprueba IPTV_BASE_URL (http vs https). En Railway muchos proveedores bloquean IPs de hosting: prueba IPTV_TLS_INSECURE=1 o despliega en un VPS con IP distinta.`
       );
     }
+  }
+
+  if (!r.ok) {
+    const hint =
+      r.status === 403
+        ? " (403 suele indicar que el panel bloquea la IP del servidor, típico en Railway/hosting)"
+        : "";
+    console.error("[iptv] HTTP", r.status, url.split("?")[0]);
+    throw new Error(
+      `El panel respondió HTTP ${r.status}${hint}. Cuerpo: ${String(text || "").slice(0, 180)}`
+    );
   }
 
   if (!text || !String(text).trim()) {
