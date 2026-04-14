@@ -131,11 +131,43 @@ async function xtream(params) {
     );
   }
 
+  const body = String(text).trim();
+  const panelErr = interpretPanelNonJsonBody(body);
+  if (panelErr) throw new Error(panelErr);
+
   try {
-    return JSON.parse(text);
+    return JSON.parse(body);
   } catch {
-    throw new Error(`Respuesta no JSON (${r.status}): ${text.slice(0, 200)}`);
+    const preview = body.slice(0, 200);
+    const looksHtml = /<\s*!?\s*html/i.test(body);
+    throw new Error(
+      looksHtml
+        ? `El panel devolvió una página HTML en lugar del API JSON. Revisa IPTV_BASE_URL (sin ruta extra; suele ser http://host:puerto) y que player_api.php exista. Vista previa: ${preview}`
+        : `Respuesta no JSON (${r.status}): ${preview}`
+    );
   }
+}
+
+/** El host a veces responde 200 con texto/HTML de error en lugar de JSON Xtream. */
+function interpretPanelNonJsonBody(s) {
+  const t = s.toLowerCase();
+  if (t.includes("invalid authorization") || t.includes("invalid user") || t.includes("banned")) {
+    return (
+      "El panel rechaza el acceso (usuario, contraseña o URL incorrectos). " +
+      "Revisa IPTV_USERNAME e IPTV_PASSWORD en Railway (sin comillas ni espacios de más) " +
+      "y IPTV_BASE_URL exactamente como te dio el proveedor (ej. http://dominio:8080, sin barra final)."
+    );
+  }
+  if (/\b404\b/.test(t) && (t.includes("error") || t.includes("url"))) {
+    return (
+      "URL del panel incorrecta (404). IPTV_BASE_URL debe ser solo host:puerto, sin rutas tipo /c/…; " +
+      "el API es /player_api.php en la raíz de ese host."
+    );
+  }
+  if (t.includes("server under maintenance") || t.includes("maintenance")) {
+    return "Panel del proveedor en mantenimiento; inténtalo más tarde.";
+  }
+  return null;
 }
 
 app.get("/api/health", (_req, res) => {
