@@ -1,6 +1,7 @@
 import dns from "node:dns";
 import fs from "fs";
 import path from "path";
+import { Readable } from "stream";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import express from "express";
@@ -26,6 +27,7 @@ const IPTV_BASE_URL = stripQuotes(process.env.IPTV_BASE_URL);
 const IPTV_USERNAME = stripQuotes(process.env.IPTV_USERNAME);
 const IPTV_PASSWORD = stripQuotes(process.env.IPTV_PASSWORD);
 const IPTV_API_PATH = stripQuotes(process.env.IPTV_API_PATH || "/player_api.php");
+const ALLOW_EXTERNAL_PROXY = process.env.IPTV_ALLOW_EXTERNAL_PROXY === "1";
 
 const debugAuth = process.env.IPTV_DEBUG_AUTH === "1";
 const logSecrets = process.env.IPTV_LOG_SECRETS === "1";
@@ -106,6 +108,47 @@ function buildXtreamUrl(params) {
     if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
   }
   return u.toString();
+}
+
+function safeUrl(input) {
+  try {
+    return new URL(input);
+  } catch {
+    return null;
+  }
+}
+
+function isProxyTargetAllowed(target) {
+  const u = safeUrl(target);
+  if (!u) return false;
+  if (!["http:", "https:"].includes(u.protocol)) return false;
+  if (ALLOW_EXTERNAL_PROXY) return true;
+  const base = safeUrl(baseUrl());
+  if (!base) return false;
+  return u.hostname === base.hostname;
+}
+
+function proxifyTarget(target) {
+  return `/api/stream-proxy?target=${encodeURIComponent(target)}`;
+}
+
+function rewriteM3u8(body, sourceUrl) {
+  const lines = String(body).split(/\r?\n/);
+  return lines
+    .map((line) => {
+      const raw = line.trim();
+      if (!raw) return line;
+      // #EXT-X-KEY / #EXT-X-MAP suelen llevar URI="..."
+      if (raw.startsWith("#")) {
+        return line.replace(/URI="([^"]+)"/g, (_m, uri) => {
+          const abs = safeUrl(uri) ? uri : new URL(uri, sourceUrl).toString();
+          return `URI="${proxifyTarget(abs)}"`;
+        });
+      }
+      const abs = safeUrl(raw) ? raw : new URL(raw, sourceUrl).toString();
+      return proxifyTarget(abs);
+    })
+    .join("\n");
 }
 
 function sslLooksLikePlainHttp(err) {
@@ -298,6 +341,60 @@ app.get("/api/series/info", async (req, res) => {
     res.json(data);
   } catch (e) {
     res.status(502).json({ error: e.message });
+  }
+});
+
+/** Proxy de streams para evitar mixed-content (HTTPS app -> HTTP IPTV). */
+app.get("/api/stream-proxy", async (req, res) => {
+  const target = req.query.target;
+  if (!target || typeof target !== "string") {
+    return res.status(400).json({ error: "target requerido" });
+  }
+  if (!isProxyTargetAllowed(target)) {
+    return res.status(403).json({
+      error:
+        "target no permitido para proxy. Si necesitas dominios externos (direct_source), activa IPTV_ALLOW_EXTERNAL_PROXY=1.",
+    });
+  }
+  try {
+    const upstream = await undiciFetch(target, {
+      dispatcher: xtreamAgent,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+      },
+    });
+    if (!upstream.ok) {
+      const txt = await upstream.text().catch(() => "");
+      return res
+        .status(upstream.status)
+        .send(txt || `stream proxy upstream error ${upstream.status}`);
+    }
+
+    const contentType = upstream.headers.get("content-type") || "";
+    const finalUrl = upstream.url || target;
+    const isM3u8 =
+      /\.m3u8(\?|$)/i.test(finalUrl) ||
+      /application\/(vnd\.apple\.mpegurl|x-mpegurl)/i.test(contentType);
+
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("access-control-allow-origin", "*");
+
+    if (isM3u8) {
+      const text = await upstream.text();
+      const rewritten = rewriteM3u8(text, finalUrl);
+      res.setHeader("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
+      return res.status(upstream.status).send(rewritten);
+    }
+
+    if (contentType) res.setHeader("content-type", contentType);
+    const len = upstream.headers.get("content-length");
+    if (len) res.setHeader("content-length", len);
+    const body = upstream.body;
+    if (!body) return res.status(502).send("upstream stream vacío");
+    Readable.fromWeb(body).pipe(res);
+  } catch (e) {
+    res.status(502).json({ error: `stream proxy error: ${e.message}` });
   }
 });
 

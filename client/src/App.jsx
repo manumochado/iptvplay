@@ -55,6 +55,18 @@ function seriesHeroUrl(s, mediaBase) {
   return posterForItem(s, "series", mediaBase || "");
 }
 
+function toPlayableUrl(url) {
+  if (!url) return url;
+  if (typeof window === "undefined") return url;
+  const isSecurePage = window.location.protocol === "https:";
+  const isHttpStream = /^http:\/\//i.test(url);
+  // Evita mixed-content en remoto (Railway https + stream http).
+  if (isSecurePage && isHttpStream) {
+    return `/api/stream-proxy?target=${encodeURIComponent(url)}`;
+  }
+  return url;
+}
+
 export default function App() {
   const [tab, setTab] = useState("live");
   const [configured, setConfigured] = useState(null);
@@ -201,11 +213,11 @@ export default function App() {
     try {
       const spec = pickLiveExt(stream);
       if (spec.mode === "url") {
-        setPlay({ src: spec.url, title: stream.name });
+        setPlay({ src: toPlayableUrl(spec.url), title: stream.name });
         return;
       }
       const { url } = await api.streamUrl("live", stream.stream_id, spec.ext);
-      setPlay({ src: url, title: stream.name });
+      setPlay({ src: toPlayableUrl(url), title: stream.name });
     } catch (e) {
       setError(e.message);
     }
@@ -216,7 +228,7 @@ export default function App() {
     try {
       const ext = pickExt(movie, "mp4");
       const { url } = await api.streamUrl("vod", movie.stream_id, ext);
-      setPlay({ src: url, title: movie.name });
+      setPlay({ src: toPlayableUrl(url), title: movie.name });
     } catch (e) {
       setError(e.message);
     }
@@ -240,7 +252,7 @@ export default function App() {
       const sid = ep.id ?? ep.stream_id;
       const { url } = await api.streamUrl("series", sid, ext);
       const t = ep.title || `T${ep.season}E${ep.episode_num}`;
-      setPlay({ src: url, title: `${seriesDetail?.name || "Serie"} — ${t}` });
+      setPlay({ src: toPlayableUrl(url), title: `${seriesDetail?.name || "Serie"} — ${t}` });
     } catch (e) {
       setError(e.message);
     }
