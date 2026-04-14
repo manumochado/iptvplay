@@ -26,8 +26,31 @@ const IPTV_BASE_URL = stripQuotes(process.env.IPTV_BASE_URL);
 const IPTV_USERNAME = stripQuotes(process.env.IPTV_USERNAME);
 const IPTV_PASSWORD = stripQuotes(process.env.IPTV_PASSWORD);
 
+const debugAuth = process.env.IPTV_DEBUG_AUTH === "1";
+const logSecrets = process.env.IPTV_LOG_SECRETS === "1";
 const tlsInsecure = process.env.IPTV_TLS_INSECURE === "1";
 const preferIpv4 = process.env.IPTV_IPV4 !== "0";
+
+function maskSecret(s) {
+  if (!s) return "(vacío)";
+  if (s.length <= 2) return "*".repeat(s.length);
+  return `${s[0]}${"*".repeat(Math.max(1, s.length - 2))}${s[s.length - 1]}`;
+}
+
+function logAuthSnapshot(reason) {
+  if (!debugAuth) return;
+  const safe = {
+    reason,
+    base_url: IPTV_BASE_URL,
+    username: logSecrets ? IPTV_USERNAME : maskSecret(IPTV_USERNAME),
+    password: logSecrets ? IPTV_PASSWORD : maskSecret(IPTV_PASSWORD),
+    username_len: IPTV_USERNAME?.length || 0,
+    password_len: IPTV_PASSWORD?.length || 0,
+    tls_insecure: tlsInsecure,
+    ipv4_forced: preferIpv4,
+  };
+  console.warn("[iptv][auth-debug]", safe);
+}
 
 const connectOpts = {
   rejectUnauthorized: !tlsInsecure,
@@ -152,6 +175,7 @@ async function xtream(params) {
 function interpretPanelNonJsonBody(s) {
   const t = s.toLowerCase();
   if (t.includes("invalid authorization") || t.includes("invalid user") || t.includes("banned")) {
+    logAuthSnapshot("invalid authorization");
     return (
       "El panel rechaza el acceso (usuario, contraseña o URL incorrectos). " +
       "Revisa IPTV_USERNAME e IPTV_PASSWORD en Railway (sin comillas ni espacios de más) " +
@@ -307,4 +331,8 @@ const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || "0.0.0.0";
 app.listen(PORT, HOST, () => {
   console.log(`IPTV app en http://${HOST}:${PORT}`);
+  logAuthSnapshot("startup");
+  if (debugAuth && logSecrets) {
+    console.warn("[iptv][auth-debug] IPTV_LOG_SECRETS=1 activo: desactivalo tras diagnosticar.");
+  }
 });
