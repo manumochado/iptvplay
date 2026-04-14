@@ -73,6 +73,8 @@ const xtreamAgent = new Agent({
 
 /** Si HTTPS falla y responde por HTTP, reutilizamos http para streams. */
 let resolvedBaseUrlOverride = null;
+/** Si la ruta API inicial falla, fijamos la alternativa que sí responde JSON. */
+let resolvedApiPathOverride = null;
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -95,13 +97,18 @@ function baseUrl() {
 }
 
 function apiPath() {
-  const p = IPTV_API_PATH.trim();
+  const p = (resolvedApiPathOverride || IPTV_API_PATH).trim();
   if (!p) return "/player_api.php";
   return p.startsWith("/") ? p : `/${p}`;
 }
 
-function buildXtreamUrl(params) {
-  const u = new URL(`${baseUrl()}${apiPath()}`);
+function apiPathCandidates() {
+  const list = [apiPath(), "/player_api.php", "/panel_api.php"];
+  return [...new Set(list)];
+}
+
+function buildXtreamUrl(params, pathOverride = apiPath()) {
+  const u = new URL(`${baseUrl()}${pathOverride}`);
   u.searchParams.set("username", IPTV_USERNAME);
   u.searchParams.set("password", IPTV_PASSWORD);
   for (const [k, v] of Object.entries(params)) {
@@ -157,68 +164,88 @@ function sslLooksLikePlainHttp(err) {
 }
 
 async function xtream(params) {
-  let url = buildXtreamUrl(params);
   const fetchOpts = {
     headers: { Accept: "application/json" },
     dispatcher: xtreamAgent,
   };
 
-  let r;
-  let text;
-  try {
-    r = await undiciFetch(url, fetchOpts);
-    text = await r.text();
-  } catch (e) {
-    if (url.startsWith("https:") && sslLooksLikePlainHttp(e)) {
-      const httpUrl = url.replace(/^https:/, "http:");
-      console.warn(
-        "[iptv] HTTPS falló (suele ser HTTP en ese puerto). Reintentando con HTTP:",
-        httpUrl.split("?")[0]
-      );
-      r = await undiciFetch(httpUrl, fetchOpts);
+  const candidates = apiPathCandidates();
+  let lastErr = null;
+
+  for (const candidatePath of candidates) {
+    let url = buildXtreamUrl(params, candidatePath);
+    let r;
+    let text;
+
+    try {
+      r = await undiciFetch(url, fetchOpts);
       text = await r.text();
-      resolvedBaseUrlOverride = IPTV_BASE_URL.replace(/^https:/i, "http:");
-    } else {
-      const code = e.cause?.code ? ` [${e.cause.code}]` : "";
-      console.error("[iptv] fetch error:", e.message, e.cause || "");
-      throw new Error(
-        `No se pudo conectar al panel IPTV: ${e.message}${code}. Comprueba IPTV_BASE_URL (http vs https) y IPTV_API_PATH (${apiPath()}). En Railway muchos proveedores bloquean IPs de hosting: prueba IPTV_TLS_INSECURE=1 o despliega en un VPS con IP distinta.`
-      );
+    } catch (e) {
+      if (url.startsWith("https:") && sslLooksLikePlainHttp(e)) {
+        const httpUrl = url.replace(/^https:/, "http:");
+        console.warn(
+          "[iptv] HTTPS fallo (suele ser HTTP en ese puerto). Reintentando con HTTP:",
+          httpUrl.split("?")[0]
+        );
+        r = await undiciFetch(httpUrl, fetchOpts);
+        text = await r.text();
+        resolvedBaseUrlOverride = IPTV_BASE_URL.replace(/^https:/i, "http:");
+      } else {
+        const code = e.cause?.code ? ` [${e.cause.code}]` : "";
+        lastErr =
+          `No se pudo conectar al panel IPTV: ${e.message}${code}. ` +
+          `Comprueba IPTV_BASE_URL (http vs https) y IPTV_API_PATH (${apiPath()}).`;
+        continue;
+      }
+    }
+
+    if (!r.ok) {
+      const hint =
+        r.status === 403
+          ? " (403 suele indicar que el panel bloquea la IP del servidor, típico en Railway/hosting)"
+          : "";
+      const msg = `El panel respondio HTTP ${r.status}${hint}. Cuerpo: ${String(text || "").slice(0, 180)}`;
+      lastErr = msg;
+      continue;
+    }
+
+    if (!text || !String(text).trim()) {
+      lastErr = `Respuesta vacia (${r.status}) desde el panel en ${candidatePath}.`;
+      continue;
+    }
+
+    const body = String(text).trim();
+    const panelErr = interpretPanelNonJsonBody(body);
+    if (panelErr) {
+      // Si es error de ruta, intentamos la siguiente candidata.
+      if (panelErr.toLowerCase().includes("url del panel/api incorrecta")) {
+        lastErr = panelErr;
+        continue;
+      }
+      throw new Error(panelErr);
+    }
+
+    try {
+      const json = JSON.parse(body);
+      if (candidatePath !== resolvedApiPathOverride) {
+        resolvedApiPathOverride = candidatePath;
+        console.warn("[iptv] Ruta API detectada automaticamente:", resolvedApiPathOverride);
+      }
+      return json;
+    } catch {
+      const preview = body.slice(0, 200);
+      const looksHtml = /<\s*!?\s*html/i.test(body);
+      lastErr = looksHtml
+        ? `El panel devolvio HTML en ${candidatePath} en lugar de JSON. Vista previa: ${preview}`
+        : `Respuesta no JSON (${r.status}) en ${candidatePath}: ${preview}`;
+      continue;
     }
   }
 
-  if (!r.ok) {
-    const hint =
-      r.status === 403
-        ? " (403 suele indicar que el panel bloquea la IP del servidor, típico en Railway/hosting)"
-        : "";
-    console.error("[iptv] HTTP", r.status, url.split("?")[0]);
-    throw new Error(
-      `El panel respondió HTTP ${r.status}${hint}. Cuerpo: ${String(text || "").slice(0, 180)}`
-    );
-  }
-
-  if (!text || !String(text).trim()) {
-    throw new Error(
-      `Respuesta vacía (${r.status}) desde el panel. Revisa IPTV_BASE_URL y que el servidor exponga ${apiPath()}.`
-    );
-  }
-
-  const body = String(text).trim();
-  const panelErr = interpretPanelNonJsonBody(body);
-  if (panelErr) throw new Error(panelErr);
-
-  try {
-    return JSON.parse(body);
-  } catch {
-    const preview = body.slice(0, 200);
-    const looksHtml = /<\s*!?\s*html/i.test(body);
-    throw new Error(
-      looksHtml
-        ? `El panel devolvió una página HTML en lugar del API JSON. Revisa IPTV_BASE_URL (sin ruta extra; suele ser http://host:puerto) y que exista ${apiPath()}. Vista previa: ${preview}`
-        : `Respuesta no JSON (${r.status}): ${preview}`
-    );
-  }
+  throw new Error(
+    lastErr ||
+      `No se pudo obtener JSON del panel. Rutas probadas: ${apiPathCandidates().join(", ")}`
+  );
 }
 
 /** El host a veces responde 200 con texto/HTML de error en lugar de JSON Xtream. */
